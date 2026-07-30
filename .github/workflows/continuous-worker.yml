@@ -1,0 +1,97 @@
+name: Continuous Windows Drive worker
+run-name: >-
+  Drive worker — ${{ github.event_name == 'push' && github.ref_name || inputs.branch }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to monitor
+        required: true
+        type: string
+
+  # ChatGPT/GitHub creates this marker once on the task branch. Replacement
+  # runs are dispatched by the Python service and never rewrite the marker.
+  push:
+    branches:
+      - '**'
+    paths:
+      - '.continuous-worker/start.txt'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: >-
+    continuous-windows-drive-worker-${{ github.event_name == 'push' && github.ref_name || inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      WATCH_BRANCH: ${{ github.event_name == 'push' && github.ref_name || inputs.branch }}
+      CONTROL_BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      # Worker control is installed once on the default branch. Task source is
+      # always checked out separately from the monitored task branch.
+      - name: Check out worker control
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: .worker-control
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          clean: false
+          sparse-checkout: |
+            scripts
+            tests
+          sparse-checkout-cone-mode: true
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Validate worker reliability
+        shell: cmd
+        run: >-
+          python -B -m unittest
+          discover
+          -s ".worker-control\tests"
+          -v
+
+      - name: Check out monitored branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.WATCH_BRANCH }}
+          path: repository
+          fetch-depth: 0
+          fetch-tags: false
+          persist-credentials: false
+          clean: false
+
+      - name: Run Drive worker and schedule replacement
+        shell: cmd
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_REMOTE: ${{ vars.RCLONE_REMOTE || 'gdrive' }}
+        run: >-
+          python ".worker-control\scripts\continuous_worker.py"
+          service
+          --repository "repository"
+          --checkout "repository"
+          --repository-full-name "%GITHUB_REPOSITORY%"
+          --branch "%WATCH_BRANCH%"
+          --control-branch "%CONTROL_BRANCH%"
+          --workflow-file "continuous-worker.yml"
+          --poll-seconds 10
+          --heartbeat-seconds 60
+          --max-runtime-minutes 360
+          --shutdown-reserve-minutes 10

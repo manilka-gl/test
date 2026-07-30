@@ -1162,6 +1162,14 @@ class PayloadReference:
     sha256: str
 
 
+def materialized_payload_filename(payload: PayloadReference) -> str:
+    """Keep the declared file suffix without duplicating it in the logical name."""
+    suffix = PurePosixPath(payload.path).suffix
+    if suffix and not payload.name.casefold().endswith(suffix.casefold()):
+        return f"{payload.name}{suffix}"
+    return payload.name
+
+
 @dataclasses.dataclass(frozen=True)
 class StepSpecification:
     kind: str
@@ -1291,6 +1299,14 @@ class CommandEnvelope:
                 if interpreter not in {"python", "pwsh"}:
                     raise WorkerError(
                         f"steps[{index}].interpreter must be python or pwsh"
+                    )
+                if (
+                    interpreter == "pwsh"
+                    and PurePosixPath(payloads[payload].path).suffix.casefold()
+                    != ".ps1"
+                ):
+                    raise WorkerError(
+                        f"steps[{index}] PowerShell payload path must end in .ps1"
                     )
                 raw_args = raw.get("args", [])
                 if not isinstance(raw_args, list) or not all(
@@ -1746,6 +1762,7 @@ class ContinuousWorker:
         payload_paths: dict[str, Path] = {}
         payload_root = directory / "payloads"
         payload_directories: dict[str, dict[str, RemoteEntry]] = {}
+        materialized_names: set[str] = set()
         for payload in envelope.payloads.values():
             remote_path = PurePosixPath(payload.path)
             remote_parent = remote_path.parent.as_posix()
@@ -1761,7 +1778,14 @@ class ContinuousWorker:
                     f"Payload Drive size mismatch for {payload.name}: "
                     f"{remote_entry.size} != {payload.size_bytes}"
                 )
-            destination = resolve_inside(payload_root, payload.name)
+            destination_name = materialized_payload_filename(payload)
+            collision_key = destination_name.casefold()
+            if collision_key in materialized_names:
+                raise WorkerError(
+                    f"Payloads resolve to the same local filename: {destination_name}"
+                )
+            materialized_names.add(collision_key)
+            destination = resolve_inside(payload_root, destination_name)
             downloaded_entry = self.drive.download(payload.path, destination)
             if (
                 remote_entry.file_id
@@ -2108,15 +2132,21 @@ class ContinuousWorker:
                 elif step.kind == "exec":
                     command = list(step.argv)
                 elif step.interpreter == "python":
+                    script_path = payload_paths[str(step.payload)]
                     command = [
                         sys.executable,
-                        str(payload_paths[str(step.payload)]),
+                        str(script_path),
                         *step.args,
                     ]
                 else:
                     pwsh = shutil.which("pwsh")
                     if not pwsh:
                         raise WorkerError("pwsh was not found for a script step")
+                    script_path = payload_paths[str(step.payload)]
+                    if script_path.suffix.casefold() != ".ps1":
+                        raise WorkerError(
+                            "Materialized PowerShell script must end in .ps1"
+                        )
                     command = [
                         pwsh,
                         "-NoLogo",
@@ -2125,7 +2155,7 @@ class ContinuousWorker:
                         "-ExecutionPolicy",
                         "Bypass",
                         "-File",
-                        str(payload_paths[str(step.payload)]),
+                        str(script_path),
                         *step.args,
                     ]
                 remaining_timeout = (

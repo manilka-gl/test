@@ -122,11 +122,13 @@ def upload_script_command(
     command_id: str,
     base_commit: str,
     script: str,
+    interpreter: str = "python",
     artifacts: list[dict[str, object]] | None = None,
 ) -> None:
-    script_path = source_root / f"{command_id}.py"
+    suffix = {"python": ".py", "pwsh": ".ps1"}[interpreter]
+    script_path = source_root / f"{command_id}{suffix}"
     script_path.write_text(script, encoding="utf-8")
-    payload_path = f"Input/files/{command_id}/command.py"
+    payload_path = f"Input/files/{command_id}/command{suffix}"
     drive.upload(script_path, payload_path)
     value = command_value(
         command_id,
@@ -143,7 +145,7 @@ def upload_script_command(
             {
                 "type": "script",
                 "payload": "command-script",
-                "interpreter": "python",
+                "interpreter": interpreter,
             }
         ],
         artifacts=artifacts,
@@ -258,6 +260,34 @@ class CommandEnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(worker.WorkerError, "Duplicate"):
             worker.unique_entries(entries)
 
+    def test_powershell_script_requires_a_ps1_drive_path(self) -> None:
+        command_id = "20260730T120000Z-pwshsuffix"
+        payload = {
+            "name": "package-script",
+            "path": f"Input/files/{command_id}/package-script",
+            "size_bytes": 1,
+            "sha256": "0" * 64,
+        }
+        value = command_value(
+            command_id,
+            "a" * 40,
+            payloads=[payload],
+            steps=[
+                {
+                    "type": "script",
+                    "payload": "package-script",
+                    "interpreter": "pwsh",
+                }
+            ],
+        )
+        with self.assertRaisesRegex(worker.WorkerError, r"must end in \.ps1"):
+            worker.CommandEnvelope.parse(
+                value,
+                filename=f"{command_id}.json",
+                repository=REPOSITORY_NAME,
+                branch=BRANCH,
+            )
+
     def test_branch_folder_is_readable_deterministic_and_collision_resistant(
         self,
     ) -> None:
@@ -358,6 +388,76 @@ class FileLockTests(unittest.TestCase):
                 self.fail("second lock unexpectedly succeeded")
             with worker.FileLock(lock_path):
                 pass
+
+
+class PayloadMaterializationTests(unittest.TestCase):
+    def test_download_preserves_python_and_powershell_suffixes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            drive = worker.LocalDirectoryDrive(root / "drive")
+            command_id = "20260730T120000Z-payloadsuffix"
+            payload_values = []
+            steps = []
+            expected: dict[str, bytes] = {}
+            for logical_name, filename, interpreter, content in (
+                ("python-script", "command.py", "python", b"print('ok')\n"),
+                ("package-script", "package.ps1", "pwsh", b"Write-Host 'ok'\n"),
+            ):
+                source = root / filename
+                source.write_bytes(content)
+                remote_path = f"Input/files/{command_id}/{filename}"
+                drive.upload(source, remote_path)
+                payload_values.append(
+                    {
+                        "name": logical_name,
+                        "path": remote_path,
+                        "size_bytes": len(content),
+                        "sha256": worker.sha256_file(source),
+                    }
+                )
+                steps.append(
+                    {
+                        "type": "script",
+                        "payload": logical_name,
+                        "interpreter": interpreter,
+                    }
+                )
+                expected[logical_name] = content
+            envelope_value = command_value(
+                command_id,
+                "a" * 40,
+                payloads=payload_values,
+                steps=steps,
+            )
+            envelope_source = root / f"{command_id}.json"
+            worker.atomic_write_json(envelope_source, envelope_value)
+            drive.upload(
+                envelope_source,
+                f"Input/commands/{command_id}.json",
+            )
+            instance = worker.ContinuousWorker(
+                repository=repository,
+                repository_full_name=REPOSITORY_NAME,
+                branch=BRANCH,
+                drive=drive,
+                token="",
+                poll_seconds=0.1,
+                max_runtime_minutes=2,
+                once=True,
+                shutdown_reserve_seconds=1,
+            )
+            entry = drive.list_files("Input/commands")[0]
+            with tempfile.TemporaryDirectory() as download_directory:
+                _, payload_paths = instance.download_envelope(
+                    entry,
+                    Path(download_directory),
+                )
+                self.assertEqual(payload_paths["python-script"].suffix, ".py")
+                self.assertEqual(payload_paths["package-script"].suffix, ".ps1")
+                for name, content in expected.items():
+                    self.assertEqual(payload_paths[name].read_bytes(), content)
 
 
 class ProcessRunnerTests(unittest.TestCase):
@@ -700,6 +800,60 @@ class PatchIntegrationTests(unittest.TestCase):
 
 
 class QueueIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required")
+    def test_powershell_script_payload_executes_with_preserved_extension(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, seed, base_commit = initialize_remote(root)
+            checkout = root / "worker"
+            git(root, "clone", str(remote), str(checkout))
+            configure_repository(checkout)
+            drive = workspace_drive(root / "drive")
+            command_id = "20260730T120000Z-pwshrun"
+            upload_script_command(
+                drive,
+                root,
+                command_id=command_id,
+                base_commit=base_commit,
+                interpreter="pwsh",
+                script=(
+                    "Set-Content -LiteralPath 'powershell-script.txt' "
+                    "-Value 'powershell-ok' -NoNewline\n"
+                ),
+            )
+            previous = os.environ.get("RUNNER_TEMP")
+            os.environ["RUNNER_TEMP"] = str(root / "runner-temp")
+            try:
+                instance = worker.ContinuousWorker(
+                    repository=checkout,
+                    repository_full_name=REPOSITORY_NAME,
+                    branch=BRANCH,
+                    drive=drive,
+                    token="",
+                    poll_seconds=0.05,
+                    max_runtime_minutes=2,
+                    once=True,
+                    shutdown_reserve_seconds=1,
+                )
+                self.assertEqual(instance.run(), 0)
+            finally:
+                if previous is None:
+                    os.environ.pop("RUNNER_TEMP", None)
+                else:
+                    os.environ["RUNNER_TEMP"] = previous
+            git(seed, "fetch", "origin", BRANCH)
+            git(seed, "reset", "--hard", f"origin/{BRANCH}")
+            self.assertEqual(
+                (seed / "powershell-script.txt").read_text(encoding="utf-8"),
+                "powershell-ok",
+            )
+            result = drive.read_json(f"Output/command_output/{command_id}.result.json")
+            self.assertEqual(result["status"], "success")
+            self.assertTrue(result["commit_created"])
+            self.assertTrue(result["pushed"])
+
     def test_failed_command_discards_source_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -1,0 +1,2 @@
+2026-07-30T15:07:00Z
+Task: Create a Rust ntfy Windows client, build and test it on the hosted Windows worker.
